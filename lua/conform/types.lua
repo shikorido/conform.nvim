@@ -78,6 +78,7 @@
 ---@field async? boolean If true the method won't block. Defaults to false. If the buffer is modified before the formatter completes, the formatting will be discarded.
 ---@field dry_run? boolean If true don't apply formatting changes to the buffer
 ---@field undojoin? boolean Use undojoin to merge formatting changes with previous edit (default false)
+---@field save_cursorpos? boolean Merge cursor line with first diff to make it persistent on undo/redo (default false)
 ---@field formatters? string[] List of formatters to run. Defaults to all formatters for the buffer filetype.
 ---@field lsp_format? conform.LspFormatOpts Configure if and when LSP should be used for formatting. Defaults to "never".
 ---@field stop_after_first? boolean Only run the first available formatter in the list. Defaults to false.

@@ -4,7 +4,10 @@ local util = require("vim.lsp.util")
 
 local M = {}
 
-local function apply_text_edits(text_edits, bufnr, offset_encoding, dry_run, undojoin)
+local function apply_text_edits(
+  text_edits, bufnr, offset_encoding,
+  dry_run, undojoin, save_cursorpos
+)
   if
     #text_edits == 1
     and text_edits[1].range.start.line == 0
@@ -15,7 +18,7 @@ local function apply_text_edits(text_edits, bufnr, offset_encoding, dry_run, und
     local original_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
     local new_lines = vim.split(text_edits[1].newText, "\r?\n", {})
     -- If it had a trailing newline, remove it to make the lines match the expected vim format
-    if #new_lines > 1 and new_lines[#new_lines] == "" then
+    if #new_lines > 1 and new_lines[#new_lines] == "" and vim.bo[bufnr].eol then
       table.remove(new_lines)
     end
     log.debug("Converting full-file LSP format to piecewise format")
@@ -26,13 +29,46 @@ local function apply_text_edits(text_edits, bufnr, offset_encoding, dry_run, und
       nil,
       false,
       dry_run,
-      undojoin
+      undojoin,
+      save_cursorpos
     )
   elseif dry_run then
     return #text_edits > 0
   else
     if undojoin then
       pcall(vim.cmd.undojoin)
+    end
+    -- What are we supposed to do in this case?
+    -- Converting text_edits to indices can be tricky and it's another one
+    -- utility function that's not used anywhere else.
+    -- By the way, I've implemented it under util.lua:text_edits_to_indices.
+    -- I will reuse runner.lua:apply_format anyway.
+    if save_cursorpos then
+      local original_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      local temp_buf = vim.api.nvim_create_buf(false, true)
+      for _, opt in { "ff", "ft", "ts", "sts", "sw", "et", "eol" } do
+        local sval = vim.api.nvim_get_option_value(opt, { buf = bufnr })
+        vim.api.nvim_set_option_value(opt, sval, { buf = temp_buf })
+      end
+      vim.api.nvim_buf_set_lines(temp_buf, 0, -1, false, original_lines)
+      vim.lsp.util.apply_text_edits(text_edits, temp_buf, offset_encoding)
+      local new_lines = vim.api.nvim_buf_get_lines(temp_buf, 0, -1, false)
+      -- If it had a trailing newline, remove it to make the lines match the expected vim format
+      if #new_lines > 1 and new_lines[#new_lines] == "" and vim.bo[bufnr].eol then
+        table.remove(new_lines)
+      end
+      log.debug("save_cursorpos=true, forwarding LSP formatted output to conform.runner")
+      vim.api.nvim_buf_delete(temp_buf, { force = true })
+      return require("conform.runner").apply_format(
+        bufnr,
+        original_lines,
+        new_lines,
+        nil,
+        false,
+        dry_run,
+        undojoin,
+        save_cursorpos
+      )
     end
     vim.lsp.util.apply_text_edits(text_edits, bufnr, offset_encoding)
     return #text_edits > 0
@@ -142,7 +178,8 @@ function M.format(options, callback)
             ctx.bufnr,
             client.offset_encoding,
             options.dry_run,
-            options.undojoin
+            options.undojoin,
+            options.save_cursorpos
           )
           changedtick = vim.b[bufnr].changedtick
 
@@ -177,7 +214,8 @@ function M.format(options, callback)
           bufnr,
           client.offset_encoding,
           options.dry_run,
-          options.undojoin
+          options.undojoin,
+          options.save_cursorpos
         )
         did_edit = did_edit or this_did_edit
 

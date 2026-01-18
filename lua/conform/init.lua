@@ -21,7 +21,10 @@ local notify_once = vim.schedule_wrap(function(...)
   vim.notify_once(...)
 end)
 
-local allowed_default_opts = { "timeout_ms", "lsp_format", "quiet", "stop_after_first" }
+local allowed_default_opts = {
+  "timeout_ms", "lsp_format", "quiet",
+  "stop_after_first", "save_cursorpos",
+}
 local allowed_default_filetype_opts = { "name", "id", "filter" }
 ---@param a table
 ---@param b table
@@ -424,7 +427,7 @@ M.format = function(opts, callback)
     )
   end
   merge_default_opts(opts, M.default_format_opts)
-  ---@type {timeout_ms: integer, bufnr: integer, async: boolean, dry_run: boolean, lsp_format: "never"|"first"|"last"|"prefer"|"fallback", quiet: boolean, stop_after_first: boolean, formatters?: string[], range?: conform.Range, undojoin: boolean}
+  ---@type {timeout_ms: integer, bufnr: integer, async: boolean, dry_run: boolean, lsp_format: "never"|"first"|"last"|"prefer"|"fallback", quiet: boolean, stop_after_first: boolean, formatters?: string[], range?: conform.Range, undojoin: boolean, save_cursorpos: boolean}
   opts = vim.tbl_extend("keep", opts, {
     timeout_ms = 1000,
     bufnr = 0,
@@ -433,6 +436,7 @@ M.format = function(opts, callback)
     lsp_format = "never",
     quiet = false,
     undojoin = false,
+    save_cursorpos = false,
     stop_after_first = false,
   })
   if opts.bufnr == 0 then
@@ -511,7 +515,10 @@ M.format = function(opts, callback)
     end, formatters)
     log.debug("Running formatters on %s: %s", vim.api.nvim_buf_get_name(opts.bufnr), resolved_names)
     ---@type conform.RunOpts
-    local run_opts = { exclusive = true, dry_run = opts.dry_run, undojoin = opts.undojoin }
+    local run_opts = {
+      exclusive = true, dry_run = opts.dry_run,
+      undojoin = opts.undojoin, save_cursorpos = opts.save_cursorpos,
+    }
     if opts.async then
       runner.format_async(opts.bufnr, formatters, opts.range, run_opts, cb)
     else
@@ -606,7 +613,10 @@ M.format_lines = function(formatter_names, lines, opts, callback)
   end
 
   ---@type conform.RunOpts
-  local run_opts = { exclusive = false, dry_run = false, undojoin = false }
+  local run_opts = {
+    exclusive = false, dry_run = false,
+    undojoin = false, save_cursorpos = false
+  }
   if opts.async then
     runner.format_lines_async(opts.bufnr, formatters, nil, lines, run_opts, handle_err)
   else

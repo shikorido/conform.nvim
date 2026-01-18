@@ -11,6 +11,7 @@ local M = {}
 ---@field exclusive boolean If true, ensure only a single formatter is running per buffer
 ---@field dry_run boolean If true, do not apply changes and stop after the first formatter attempts to do so
 ---@field undojoin boolean Use undojoin to merge formatting changes with previous edit
+---@field save_cursorpos boolean Merge cursor line with first diff to make it persistent on undo/redo
 
 ---@param formatter_name string
 ---@param ctx conform.Context
@@ -172,12 +173,383 @@ local function create_text_edit(
 end
 
 ---@param bufnr integer
+---@param indices integer[][]
+---@param original_lines string[]
+---@param new_lines string[]
+---@return integer[][] new_indices
+local function merge_cursor_line_with_first_diff(
+  bufnr,
+  indices,
+  original_lines,
+  new_lines
+)
+  -- NOTE: Delete is an only edge case that breaks cursor pos on redo.
+  --       From my tests, insert does not cause the issue.
+  -- Lets assume we have a nicely formatted file.
+  -- For now, if we insert couple newlines in lua table (or other
+  -- syntax constructions that are not aware of newlines)
+  -- and then run stylua format with cursor at the end of file.
+  -- In result, we get less lines and nvim on redo (after undo)
+  -- won't be able to locate cursor line that was deleted,
+  -- therefore it places cursor at the beginning of first change.
+  --
+  -- As possible solutions:
+  -- 1. We can append newlines at the end of formatted lines
+  --    to preserve line number cursor stays on.
+  -- 2. We can set cursor line to the end of formatted lines
+  --    before applying format,
+  --    initial pos will be lost but no junk left.
+  --
+  -- I've chosen a second one.
+
+  indices = vim.deepcopy(indices)
+
+  -- Convert inserts and deletes to replaces.
+  -- It definetely helps to avoid tweaking issues with delete diff,
+  -- I'm not sure about insert, but probably it is also broken.
+  -- TODO: Figure out how to avoid doing this.
+  for i, idx in ipairs(indices) do
+    local orig_line_start, orig_line_count, new_line_start, new_line_count = unpack(idx)
+
+    if orig_line_count == 0 then -- insert to replace
+      -- "a\nb\nc\ne"
+      -- "a\nb\nc\nd\ne"
+      -- (3,0,4,1) - insert
+      -- (3,1,3,2) - replace
+      --
+      -- "a\nb\nc\ne"
+      -- "a\nb\nc\nd\ne\nf"
+      -- (3,0,4,2) - insert
+      -- (3,1,3,3) - replace
+      --
+      -- "a\nb\nc\nd"
+      -- "a\nb\nc\nd\ne\nf"
+      -- (4,0,5,2) - insert
+      -- (4,1,4,3) - replace
+      --
+      -- There is an edge cases subset.
+      -- "a"
+      -- "b\na"
+      -- (0,0,1,1) - insert
+      -- (0,1,0,2) - replace (wrong, -1..-1 range)
+      -- (1,1,1,2) - replace (correct)
+      orig_line_count = 1
+      new_line_start = new_line_start - 1
+      new_line_count = new_line_count + 1
+    end
+
+    if new_line_count == 0 then -- delete to replace
+      -- "a\nb\nc\nd\ne"
+      -- "a\nb\nc\ne"
+      -- (4,1,3,0) - delete
+      -- (3,2,3,1) - replace
+      --
+      -- "a\nb\nc\nd\ne\nf"
+      -- "a\nb\nc\ne"
+      -- (4,2,3,0) - delete
+      -- (3,3,3,1) - replace
+      --
+      -- "a\nb\nc\nd\ne\nf"
+      -- "a\nb\nc\nd"
+      -- (5,2,4,0) - delete
+      -- (4,3,4,1) - replace
+      --
+      -- There is an edge cases subset.
+      -- "a\nb\nc\nd\ne"
+      -- "b\nc\n\nd\ne"
+      -- (1,1,0,0) - delete
+      -- (0,2,0,1) - replace (wrong, -1..0 range and replacement contains nil (tbl[i], i = 0) from util.tbl_slice)
+      -- (1,2,1,1) - replace (correct)
+      new_line_count = 1
+      orig_line_start = orig_line_start - 1
+      orig_line_count = orig_line_count + 1
+    end
+
+    -- Insert/delete edge cases fix.
+    if orig_line_start == 0 then
+      orig_line_start = 1
+    end
+    if new_line_start == 0 then
+      new_line_start = 1
+    end
+
+    indices[i] = {
+      orig_line_start,
+      orig_line_count,
+      new_line_start,
+      new_line_count,
+    }
+  end
+
+  -- Try to minimize the work if first diff is good.
+  local idx = indices[1]
+  if not idx then
+    return indices
+  end
+
+  -- 1,1-indexed, actually we don't need cursor_pos, even if
+  -- cursor doesn't intersect with col that was changed,
+  -- vim still remembers cursor line and col after change.
+  local cursor_line = vim.api.nvim_buf_call(bufnr, function()
+    local _, line = unpack(vim.fn.getpos("."))
+    return line
+  end)
+
+  local orig_line_start, orig_line_count, new_line_start, new_line_count = unpack(idx)
+
+  -- If cursor line is above first diff.
+  if orig_line_start > cursor_line and
+    new_line_start > cursor_line then
+    table.insert(indices, 1, { cursor_line, 1, cursor_line, 1 })
+    return indices
+  end
+
+  -- Remember first diff start lines.
+  local tweaked_orig_first_diff_start = orig_line_start
+  local tweaked_new_first_diff_start = new_line_start
+  local tweaked_orig_first_diff_count, tweaked_new_first_diff_count
+
+  -- Set maximum clamp counts. Count is treated as exclusive.
+  -- For line_start=3 and line_count=1: 3,1 covers only line 3 (3+1-1).
+  -- For line_start=3 and line_count=3: 3,3 covers 3,4,5 lines (3+3-1).
+  local max_orig_count = #original_lines - orig_line_start + 1
+  local max_new_count = #new_lines - new_line_start + 1
+
+  local new_indices = {}
+
+  -- Exclusive end.
+  local orig_line_end = orig_line_start + orig_line_count
+  local new_line_end = new_line_start + new_line_count
+
+  -- Check if cursor line intersects both orig and new for stable undo/redo.
+  -- Avoid insert/delete intentionally (count=0).
+  if cursor_line >= orig_line_start and cursor_line < orig_line_end and
+    cursor_line >= new_line_start and cursor_line < new_line_end then
+
+    -- Tweak first diff counts.
+    tweaked_orig_first_diff_count = orig_line_count
+    tweaked_new_first_diff_count = new_line_count
+
+    indices[1] = {
+      tweaked_orig_first_diff_start,
+      tweaked_orig_first_diff_count,
+      tweaked_new_first_diff_start,
+      tweaked_new_first_diff_count
+    }
+
+    return indices
+
+  else -- comes after both orig and new, or one of
+    -- We can't rely on first diff counts to ensure
+    -- that orig:new lines mapping is correct at the cursor line.
+    -- It will be done in the next for cycle.
+    local orig_cursor_lines_count = cursor_line - orig_line_start + 1
+    local new_cursor_lines_count = cursor_line - new_line_start + 1
+    tweaked_orig_first_diff_count = orig_cursor_lines_count
+    tweaked_new_first_diff_count = new_cursor_lines_count
+  end
+
+  local any_intersected
+  for i = 1, #indices do
+    idx = indices[i]
+
+    orig_line_start, orig_line_count, new_line_start, new_line_count = unpack(idx)
+
+    -- The two require special handling I haven't came up with yet.
+    --local is_insert = orig_line_count == 0
+    --local is_delete = new_line_count == 0
+
+    -- Inclusive end.
+    orig_line_end = orig_line_start + orig_line_count - 1
+    new_line_end = new_line_start + new_line_count - 1
+    local tweaked_orig_first_diff_end = tweaked_orig_first_diff_start + tweaked_orig_first_diff_count - 1
+    local tweaked_new_first_diff_end = tweaked_new_first_diff_start + tweaked_new_first_diff_count - 1
+
+    local orig_ends_diff = orig_line_end - tweaked_orig_first_diff_end
+    local new_ends_diff = new_line_end - tweaked_new_first_diff_end
+
+    -- Force intersection of the last diff
+    -- if there were no previous intersections.
+    if i == #indices and not any_intersected then
+      any_intersected = true
+    end
+
+    -- Since lua has no continue, first if filters out
+    -- diffs that are within merged diff.
+    if any_intersected or
+      tweaked_orig_first_diff_end >= orig_line_end or
+      tweaked_new_first_diff_end >= new_line_end then
+
+      -- Check if first diff overlaps with other diffs.
+      if any_intersected or orig_ends_diff >= 0 or new_ends_diff >= 0 then
+        -- Instead of trying to reduce the diff
+        -- lets merge it with our new first diff.
+        -- It helps to avoid some complicated logic.
+
+        any_intersected = true
+
+        -- Normalize.
+        if orig_ends_diff < 0 or new_ends_diff < 0 then
+          local max_neg_abs = math.abs(math.min(orig_ends_diff, new_ends_diff))
+          orig_ends_diff = orig_ends_diff + max_neg_abs
+          new_ends_diff = new_ends_diff + max_neg_abs
+        end
+
+        tweaked_orig_first_diff_count = math.min(tweaked_orig_first_diff_count + orig_ends_diff, max_orig_count)
+        tweaked_new_first_diff_count = math.min(tweaked_new_first_diff_count + new_ends_diff, max_new_count)
+
+        -- Is it possible that:
+
+        -- a) new tweaked first diff counts are less than 0? I've not tested this code with insert/delete diffs well.
+        if tweaked_orig_first_diff_count < 0 or tweaked_new_first_diff_count < 0 then
+          vim.notify(
+            "tweaked_orig_first_diff_count or tweaked_new_first_diff_count are less than zero!",
+            vim.log.levels.ERROR
+          )
+        end
+
+        -- Yes, if the line that cursor stayed on was deleted.
+        -- b) cursor line can be out-of-scope after the tweaks above?
+        -- Inclusive end.
+        local tweaked_orig_first_diff_end_new = tweaked_orig_first_diff_start + tweaked_orig_first_diff_count - 1
+        local tweaked_new_first_diff_end_new = tweaked_new_first_diff_start + tweaked_new_first_diff_count - 1
+        if cursor_line > tweaked_orig_first_diff_end_new or
+          cursor_line > tweaked_new_first_diff_end_new then
+          --vim.notify(
+          --  "cursor_line is out-of-scope of first diff after count tweak:\n"..
+          --  "cursor_line="..cursor_line.."\n"..
+          --  "#original_lines="..#original_lines.."\n"..
+          --  "#new_lines="..#new_lines.."\n"..
+          --  "tweaked_orig_first_diff_end_new="..tweaked_orig_first_diff_end_new.."\n"..
+          --  "tweaked_new_first_diff_end_new="..tweaked_new_first_diff_end_new,
+          --  vim.log.levels.ERROR
+          --)
+          if cursor_line > #new_lines then
+            vim.api.nvim_buf_call(bufnr, function()
+              local view = vim.fn.winsaveview()
+              local diff = cursor_line - #new_lines
+              view.lnum = view.lnum - diff
+              view.topline = view.topline - diff
+              vim.fn.winrestview(view)
+            end)
+          end
+        end
+
+        -- Shouldn't due to clamping.
+        -- c) tweaked diff reached EOF on one or both ends?
+        if tweaked_orig_first_diff_end_new > #original_lines or
+          tweaked_new_first_diff_end_new > #new_lines then
+          vim.notify(
+            "one or both ends in a tweaked first diff reached EOF:\n"..
+            "tweaked_orig_first_diff_start="..tweaked_orig_first_diff_start.."\n"..
+            "tweaked_orig_first_diff_count="..tweaked_orig_first_diff_count.."\n"..
+            "tweaked_new_first_diff_start="..tweaked_new_first_diff_start.."\n"..
+            "tweaked_new_first_diff_count="..tweaked_new_first_diff_count.."\n"..
+            "cursor_line="..cursor_line.."\n"..
+            "#original_lines="..#original_lines.."\n"..
+            "tweaked_orig_first_diff_end_new="..tweaked_orig_first_diff_end_new.."\n"..
+            "#new_lines="..#new_lines.."\n"..
+            "tweaked_new_first_diff_end_new="..tweaked_new_first_diff_end_new,
+            vim.log.levels.ERROR
+          )
+        end
+
+        -- Since we've extended our first diff, replace it.
+        new_indices[1] = {
+          tweaked_orig_first_diff_start,
+          tweaked_orig_first_diff_count,
+          tweaked_new_first_diff_start,
+          tweaked_new_first_diff_count,
+        }
+      end
+    else
+      table.insert(new_indices, idx)
+    end
+  end
+
+  -- Check if new_indices is not empty.
+  if #new_indices ~= 0 then
+    indices = new_indices
+  end
+
+  return indices
+end
+
+---@param unified string
+---@return integer[][] indices
+local function indices_from_unified(unified)
+  if #unified == 0 then return {} end
+
+  local lines = vim.split(unified, "\n")
+  assert(lines[1]:find("^@@[^@]+@@$"), "Unified diff does not contain @@ .. @@ header")
+
+  local indices = {}
+  local diff = "-"
+  local no_newline_count = 0
+
+  local orig_line_start, orig_line_count, new_line_start, new_line_count
+
+  for i = 1, #lines do
+    local line = lines[i]
+
+    if line:find("^@@[^@]+@@$") or i == #lines then
+      if orig_line_start then
+        table.insert(indices, {
+          orig_line_start,
+          orig_line_count,
+          new_line_start,
+          new_line_count,
+        })
+      end
+    end
+
+    if line:find("^@@[^@]+@@$") then
+      orig_line_start, orig_line_count, new_line_start, new_line_count =
+        line:gmatch("@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")()
+
+      if orig_line_count == "" then orig_line_count = 1 end
+      if new_line_count == "" then new_line_count = 1 end
+
+      orig_line_start = tonumber(orig_line_start)
+      new_line_start = tonumber(new_line_start)
+      orig_line_count = tonumber(orig_line_count)
+      new_line_count = tonumber(new_line_count)
+    else
+      if line:sub(1, 1) == "-" then
+        diff = "-"
+      elseif line:sub(1, 1) == "+" then
+        diff = "+"
+      end
+
+      if line:find("\\ No newline at end of file") then
+        no_newline_count = no_newline_count + 1
+
+        if diff == "+" then -- new lines lack NL at EOF
+          orig_line_count = orig_line_count + 1
+        elseif diff == "-" then -- original lines lack NL at EOF
+          new_line_count = new_line_count + 1
+        end
+
+        -- Undo if original and new lines lack NL at EOF.
+        if no_newline_count == 2 then
+          orig_line_count = orig_line_count - 1
+          new_line_count = new_line_count - 1
+        end
+      end
+    end
+  end
+
+  return indices
+end
+
+---@param bufnr integer
 ---@param original_lines string[]
 ---@param new_lines string[]
 ---@param range? conform.Range
 ---@param only_apply_range boolean
 ---@param dry_run boolean
 ---@param undojoin boolean
+---@param save_cursorpos boolean
 ---@return boolean any_changes
 M.apply_format = function(
   bufnr,
@@ -186,7 +558,8 @@ M.apply_format = function(
   range,
   only_apply_range,
   dry_run,
-  undojoin
+  undojoin,
+  save_cursorpos
 )
   if bufnr == 0 then
     bufnr = vim.api.nvim_get_current_buf()
@@ -200,12 +573,34 @@ M.apply_format = function(
   -- result_type has some text to indicate that the eol changed, but the indices result_type has no
   -- such indication. To work around this, we just add a trailing newline to the end of both the old
   -- and the new text.
-  table.insert(original_lines, "")
-  table.insert(new_lines, "")
+  --
+  -- Remark: The solution won't help in edge cases when there are
+  -- 2 newlines at the end and only 1 left after formatting if eol is false (noeol).
+  -- Probably because we tend to remove the last NL from formatter
+  -- to get vim lines representation if eol is true,
+  -- therefore diff gets no NL at eof from new lines.
+  -- Lets assume, original lines [19,20] = NL, new lines [19] = NL, [20] - deleted,
+  -- i.e. the format config wants 1 stray NL at the end,
+  -- which will give (20,1,19,0) indices with an additional syntetic NL ([19,20,21] vs [19,20])
+  -- instead of (19,1,18,0).
+  -- In (19,1,18,0) case unified diff has no "\ No newline" designation,
+  -- it only removes 1 empty line.
+  -- Whereas (20,1,19,0) tries to remove non-existent syntetic NL at 21
+  -- which was removed from tables of lines.
+  -- Syntetic new lines lead to incorrect line numbers occasionally.
+  -- I think, only unified diff parsing can be used to
+  -- handle such edge cases, otherwise we need to adjust indices result somehow.
+  --
+  -- Remark 2: Due to the fact how vim handles newlines at eof,
+  -- there is no point to have more than 1 nl-at-eof, eol values do not matter,
+  -- last NL will always be consumed by vim, even with noeol.
+  -- Can be easily checked with `nvim --clean +'set noeol nofixeol' test_file`.
+  --table.insert(original_lines, "")
+  --table.insert(new_lines, "")
   local original_text = table.concat(original_lines, "\n")
   local new_text = table.concat(new_lines, "\n")
-  table.remove(original_lines)
-  table.remove(new_lines)
+  --table.remove(original_lines)
+  --table.remove(new_lines)
 
   -- Abort if output is empty but input is not (i.e. has some non-whitespace characters).
   -- This is to hack around oddly behaving formatters (e.g black outputs nothing for excluded files).
@@ -215,13 +610,38 @@ M.apply_format = function(
   end
 
   log.trace("Comparing lines %s and %s", original_lines, new_lines)
-  ---@diagnostic disable-next-line: missing-fields
-  local indices = vim.diff(original_text, new_text, {
-    result_type = "indices",
+  -----@diagnostic disable-next-line: missing-fields
+  --local indices = vim.diff(original_text, new_text, {
+  --  result_type = "indices",
+  --  algorithm = "histogram",
+  --})
+  local unified = vim.diff(original_text, new_text, {
     algorithm = "histogram",
   })
+  local indices = indices_from_unified(unified)
   assert(type(indices) == "table")
   log.trace("Diff indices %s", indices)
+
+  if save_cursorpos then
+    -- Before proceeding to text_edits construction,
+    -- we should merge first diff with cursor line
+    -- if cursor line is located after first diff,
+    -- otherwise simply add 1 line "diff" on cursor line.
+    indices = merge_cursor_line_with_first_diff(
+      bufnr,
+      indices,
+      original_lines,
+      new_lines
+    )
+    log.trace("Diff indices after merging cursor line with first diff %s", indices)
+    log.trace(
+      "Unified diff:\n%s",
+      vim.diff(original_text, new_text, {
+        algorithm = "histogram"
+      })
+    )
+  end
+
   local text_edits = {}
   for _, idx in ipairs(indices) do
     local orig_line_start, orig_line_count, new_line_start, new_line_count = unpack(idx)
@@ -271,6 +691,26 @@ M.apply_format = function(
   end
 
   if not dry_run then
+    if save_cursorpos then
+      log.trace(
+        "Original text:\n%s\n"..
+        "New text:\n%s\n"..
+        "Text edits:\n%s",
+        original_text,
+        new_text,
+        vim.inspect(text_edits)
+      )
+    end
+
+    local savedview
+    if save_cursorpos then
+      -- Also save view, because edits application
+      -- can shift cursor position. Often happens if diff has less/more lines.
+      savedview = vim.api.nvim_buf_call(bufnr, function()
+        return vim.fn.winsaveview()
+      end)
+    end
+
     log.trace("Applying text edits: %s", text_edits)
     if undojoin then
       -- may fail if after undo
@@ -279,6 +719,12 @@ M.apply_format = function(
     end
     vim.lsp.util.apply_text_edits(text_edits, bufnr, "utf-8")
     log.trace("Done formatting %s", bufname)
+
+    if save_cursorpos then
+      vim.api.nvim_buf_call(bufnr, function()
+        vim.fn.winrestview(savedview)
+      end)
+    end
   end
 
   return not vim.tbl_isempty(text_edits)
@@ -572,7 +1018,8 @@ M.format_async = function(bufnr, formatters, range, opts, callback)
           range,
           not all_support_range_formatting,
           opts.dry_run,
-          opts.undojoin
+          opts.undojoin,
+          opts.save_cursorpos
         )
       end
       callback(err, did_edit)
@@ -647,7 +1094,8 @@ M.format_sync = function(bufnr, formatters, timeout_ms, range, opts)
     range,
     not all_support_range_formatting,
     opts.dry_run,
-    opts.undojoin
+    opts.undojoin,
+    opts.save_cursorpos
   )
   return err, did_edit
 end

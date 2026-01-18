@@ -267,4 +267,129 @@ M.buf_line_ending = function(bufnr)
   end
 end
 
+---@param text_edits any
+M.text_edits_to_indices = function(text_edits)
+  -- Before proceeding to the main logic,
+  -- heuristically find out whether
+  -- replace text edits are built using common prefix and suffix.
+  local reduced_replace_diffs
+  for _, text_edit in ipairs(text_edits) do
+    if text_edit.range.start.character ~= 0 or
+      text_edit.range["end"].character ~= 0 then
+      reduced_replace_diffs = true
+      break
+    end
+  end
+
+  local indices = {}
+  -- Line insertion text edit:
+  --text_edit = {
+  --  newText = "abc\n",
+  --  range = {
+  --    start = { line = 0, character = 0 },
+  --    ["end"] = { line = 0, character = 0 }
+  --  }
+  --}
+  -- Converts to insert indices:
+  -- orig_line_start = 0
+  -- orig_line_count = 0
+  -- new_line_start = 1
+  -- new_line_count = 1
+  -- (0,0,1,1)
+  -- And to replace indices (wrong -> correct):
+  -- (0,1,0,2) -> (1,1,1,2)
+  ---
+  -- Line removal text edit:
+  --text_edit = {
+  --  newText = "",
+  --  range = {
+  --    start = { line = 0, character = 0 },
+  --    ["end"] = { line = 1, character = 0 }
+  --  }
+  --}
+  -- Converts to delete indices:
+  -- orig_line_start = 1
+  -- orig_line_count = 1
+  -- new_line_start = 0
+  -- new_line_count = 0
+  -- (1,1,0,0)
+  -- And to replace indices (wrong -> correct):
+  -- (0,2,0,1) -> (1,2,1,1)
+  --local tracked_new_line
+  local total_new_lines_diff = 0
+  for i, text_edit in ipairs(text_edits) do
+    local orig_line_start, orig_line_count, new_line_start, new_line_count
+    local st, en = text_edit.range.start, text_edit.range["end"]
+    local is_replace
+
+    if st.character ~= 0 or en.character ~= 0 then
+      is_replace = true
+    end
+
+    orig_line_start = st.line + 1
+    orig_line_count = en.line + 2 - orig_line_start
+
+    new_line_start = orig_line_start + total_new_lines_diff
+
+    -- Find new lines diff for the current text edit.
+    local new_lines_diff = -orig_line_count
+
+    -- Set to 1 cause it must be an empty string at least.
+    local lines_in_new_text = 1
+
+    -- Increment lines in a new text for each LF character encountered.
+    local new_text = text_edit.newText
+    for j = 1, new_text:len() do
+      if string.byte(new_text, j) == 10 then
+        lines_in_new_text = lines_in_new_text + 1
+      end
+    end
+
+    new_line_count = lines_in_new_text
+    new_lines_diff = new_lines_diff + lines_in_new_text
+    total_new_lines_diff = total_new_lines_diff + new_lines_diff
+
+    -- If reduced_replace_diffs aren't used, ignore last lines.
+    -- Note, that it also means to ignore last LF
+    -- which is added intentionally.
+    if not reduced_replace_diffs and lines_in_new_text > 1 and
+      st.line ~= en.line and st.character == 0 and en.character == 0 then
+      orig_line_count = orig_line_count - 1
+      new_line_count = new_line_count - 1
+      is_replace = true
+    end
+
+    -- In the following guesses we want to be very specific.
+    -- Note: It can guess insert diffs more correctly only when
+    -- we're reducing replace diff with a common prefix and suffix,
+    -- cause in this case both character positions unlikely will be equal to 0,
+    -- unless there is a strange text edit record from replace diff.
+    --
+    -- Infer insert.
+    if not is_replace then
+      if new_text ~= "" and new_line_count > 1 and (orig_line_count - 1 == 0) and
+        st.line == en.line and st.character == 0 and en.character == 0 then
+        orig_line_start = orig_line_start - 1
+        orig_line_count = 0
+        new_line_count = new_line_count - 1
+
+        -- Infer delete, it doesn't require reduced_replace_diffs.
+      elseif new_text == "" and (new_line_count - 1 == 0) and
+        st.line ~= en.line and st.character == 0 and en.character == 0 then
+        orig_line_count = orig_line_count - 1
+        new_line_start = new_line_start - 1
+        new_line_count = 0
+      end
+    end
+
+    indices[i] = {
+      orig_line_start,
+      orig_line_count,
+      new_line_start,
+      new_line_count,
+    }
+  end
+  return indices
+end
+
 return M
